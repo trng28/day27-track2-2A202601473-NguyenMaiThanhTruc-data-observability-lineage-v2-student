@@ -17,12 +17,24 @@ sys.path.insert(0, str(ROOT))
 
 try:
     import great_expectations as gx
-except ImportError as exc:  # friendlier classroom failure
-    raise SystemExit("great_expectations is not installed. Run: pip install -r requirements.txt") from exc
+except ImportError:
+    gx = None
+
+from src.contract_validator import failed_issues, load_contract, validate_dataframe
 
 
 def main() -> None:
     df = pd.read_csv(ROOT / "data" / "incoming" / "orders.csv")
+    if gx is None:
+        results = validate_dataframe(df, load_contract(ROOT / "contracts" / "orders_contract.yaml"))
+        failed = failed_issues(results)
+        for result in results:
+            print(f"{result['check']:<24} column={str(result['column']):<12} passed={result['passed']}")
+        actions = sorted({result["action"] for result in failed})
+        print("\nEquivalent validation result:", "PASS" if not failed else "FAIL")
+        print("Actions:", ", ".join(actions) if actions else "none")
+        raise SystemExit(1 if any(item["severity"] == "critical" for item in failed) else 0)
+
     context = gx.get_context()
 
     # Use unique names so re-running inside an ephemeral context is simple.

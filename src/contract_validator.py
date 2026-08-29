@@ -25,12 +25,14 @@ def _issue(
     passed: bool,
     details: str,
 ) -> dict[str, Any]:
+    action_by_severity = {"critical": "block", "warning": "quarantine", "info": "warn"}
     return {
         "check": check,
         "column": column,
         "severity": severity,
         "passed": bool(passed),
         "details": details,
+        "action": "none" if passed else action_by_severity.get(severity, "warn"),
     }
 
 
@@ -41,7 +43,7 @@ def load_contract(path: str | Path) -> dict[str, Any]:
 
 def validate_dataframe(df: pd.DataFrame, contract: dict[str, Any]) -> list[dict[str, Any]]:
     issues: list[dict[str, Any]] = []
-    columns = contract.get("columns", {})
+    columns = contract.get("columns", contract.get("fields", {}))
 
     for column, rules in columns.items():
         severity = rules.get("severity", "warning")
@@ -61,6 +63,33 @@ def validate_dataframe(df: pd.DataFrame, contract: dict[str, Any]) -> list[dict[
             continue
 
         series = df[column]
+
+        declared_type = rules.get("type")
+        if declared_type:
+            non_null = series.dropna()
+            if declared_type == "integer":
+                parsed = pd.to_numeric(non_null, errors="coerce")
+                valid = parsed.notna() & (parsed % 1 == 0)
+            elif declared_type == "number":
+                valid = pd.to_numeric(non_null, errors="coerce").notna()
+            elif declared_type == "datetime":
+                valid = pd.to_datetime(non_null, errors="coerce", utc=True).notna()
+            elif declared_type == "boolean":
+                valid = non_null.map(lambda value: isinstance(value, bool))
+            elif declared_type == "string":
+                valid = non_null.map(lambda value: isinstance(value, str))
+            else:
+                valid = pd.Series(False, index=non_null.index)
+            invalid_count = int((~valid).sum())
+            issues.append(
+                _issue(
+                    "type",
+                    column=column,
+                    severity=severity,
+                    passed=(invalid_count == 0),
+                    details=f"declared_type={declared_type}; invalid_count={invalid_count}",
+                )
+            )
 
         if required:
             null_count = int(series.isna().sum())
@@ -100,10 +129,19 @@ def validate_dataframe(df: pd.DataFrame, contract: dict[str, Any]) -> list[dict[
                 )
             )
 
+        if "min_length" in rules:
+            lengths = series.dropna().astype(str).str.len()
+            invalid_count = int((lengths < int(rules["min_length"])).sum())
+            issues.append(
+                _issue("min_length", column=column, severity=severity,
+                       passed=(invalid_count == 0),
+                       details=f"invalid_count={invalid_count}; min_length={rules['min_length']}")
+            )
+
         # Starter numeric range support. Type validation is intentionally minimal.
         if "min" in rules or "max" in rules:
             numeric = pd.to_numeric(series, errors="coerce")
-            invalid = pd.Series(False, index=series.index)
+            invalid = series.notna() & numeric.isna()
             if "min" in rules:
                 invalid |= numeric < rules["min"]
             if "max" in rules:
@@ -119,9 +157,32 @@ def validate_dataframe(df: pd.DataFrame, contract: dict[str, Any]) -> list[dict[
                 )
             )
 
-    # TODO(student): validate contract-level freshness using contract['freshness'].
-    # TODO(student): validate declared data types. pd.to_numeric(..., errors='coerce')
-    #                can silently hide string/type drift if you do not check it explicitly.
+    freshness = contract.get("freshness")
+    if freshness:
+        column = freshness.get("column")
+        severity = freshness.get("severity", "warning")
+        max_delay = float(freshness.get("max_delay_minutes", 0))
+        if column not in df.columns:
+            issues.append(_issue("freshness", column=column, severity=severity, passed=False,
+                                 details="freshness column is missing"))
+        else:
+            timestamps = pd.to_datetime(df[column], errors="coerce", utc=True)
+            if timestamps.notna().sum() == 0:
+                issues.append(_issue("freshness", column=column, severity=severity, passed=False,
+                                     details="no valid freshness timestamp"))
+            else:
+                reference_column = freshness.get("reference_column", "created_at")
+                if reference_column in df.columns:
+                    reference = pd.to_datetime(df[reference_column], errors="coerce", utc=True).max()
+                else:
+                    configured = freshness.get("reference_time")
+                    reference = (pd.to_datetime(configured, errors="coerce", utc=True)
+                                 if configured else pd.Timestamp.now(tz="UTC"))
+                latest = timestamps.max()
+                delay = max(0.0, float((reference - latest).total_seconds() / 60)) if pd.notna(reference) else 0.0
+                issues.append(_issue("freshness", column=column, severity=severity,
+                                     passed=(delay <= max_delay),
+                                     details=f"delay_minutes={delay:.2f}; max_delay_minutes={max_delay:.2f}"))
 
     return issues
 

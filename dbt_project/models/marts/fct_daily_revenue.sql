@@ -8,9 +8,13 @@ with completed_orders as (
     where status = 'completed'
 ),
 active_customers as (
-    select *
+    select customer_id
     from {{ ref('stg_customers') }}
     where is_active = true
+    qualify row_number() over (
+        partition by customer_id
+        order by valid_from desc
+    ) = 1
 )
 select
     o.order_date,

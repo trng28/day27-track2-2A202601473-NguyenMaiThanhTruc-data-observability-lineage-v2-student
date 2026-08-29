@@ -39,7 +39,10 @@ def mad_detector(current: float, history: Iterable[float], threshold: float = 3.
     median = float(np.median(values))
     mad = float(np.median(np.abs(values - median)))
     if mad == 0:
-        return {"is_anomaly": False, "score": 0.0, "method": "mad", "reason": "mad_is_zero_todo"}
+        deviation = abs(float(current) - median)
+        score = float("inf") if deviation > 0 else 0.0
+        return {"is_anomaly": bool(deviation > 0), "score": score, "method": "mad",
+                "reason": f"median={median:.3f}, mad=0; exact_baseline_comparison"}
     modified_z = 0.6745 * abs(float(current) - median) / mad
     return {
         "is_anomaly": bool(modified_z > threshold),
@@ -59,22 +62,30 @@ def detect_anomaly(
 ) -> dict[str, Any]:
     """Stable lab API.
 
-    Current starter behavior:
+    Supported behavior:
     - `zscore`: basic z-score.
-    - `mad`: MAD example.
-    - `auto`: still uses naive z-score and ignores context.
+    - `mad`: robust median absolute deviation detector.
+    - `auto`: context-aware MAD with a z-score fallback for short histories.
 
-    TODO(student): make `auto` context-aware. Useful context keys used by the
-    instructor may include `day_of_week`, `same_segment_history`,
-    `metric_name`, `known_event`, and `trend`.
+    Context may include `same_segment_history`, `metric_name`, `known_event`
+    and other caller metadata.
     """
+    values = list(history)
     if method == "mad":
-        return mad_detector(current, history)
-    if method in {"zscore", "auto"}:
-        result = zscore_detector(current, history, threshold=threshold)
-        if method == "auto":
+        return mad_detector(current, values)
+    if method == "zscore":
+        return zscore_detector(current, values, threshold=threshold)
+    if method == "auto":
+        context = context or {}
+        if context.get("known_event"):
+            return {"is_anomaly": False, "score": 0.0, "method": "auto:known_event",
+                    "reason": f"suppressed_known_event={context['known_event']}"}
+        segment = context.get("same_segment_history")
+        selected = list(segment) if segment is not None and len(segment) >= 5 else values
+        result = mad_detector(current, selected)
+        result["method"] = "auto:same_segment_mad" if selected is not values else "auto:mad"
+        if result["reason"] == "insufficient_history":
+            result = zscore_detector(current, selected, threshold=threshold)
             result["method"] = "auto:zscore"
-            if context:
-                result["reason"] += "; context_ignored_by_starter=true"
         return result
     raise ValueError(f"Unsupported method: {method}")
